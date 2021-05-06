@@ -24,14 +24,12 @@
 /* ------------------------- Prototypes ----------------------------------- */
 
 int start3 (char *); 
-
 static int	ClockDriver(char *);
 static int	DiskDriver(char *);
-
-static void sleep_vec_in(sysargs *);
+static void sleep(sysargs *);
 static void disk_read(sysargs *);
-static void disk_write_vec_in(sysargs *);
-static void disk_size_vec_in(sysargs *);
+static void disk_write(sysargs *);
+static void disk_size(sysargs *);
 int insert_sleep_q(driver_proc_ptr);
 int remove_sleep_q(driver_proc_ptr);
 int insert_disk_q(driver_proc_ptr);
@@ -55,6 +53,7 @@ int sleep_number = 0;
 driver_proc_ptr DQ = NULL;
 int DQ_number = 0;
 
+bool exit_logic = false;
 static int diskpids[DISK_UNITS];
 static int num_tracks[DISK_UNITS];
 static int sleep_semaphore;
@@ -83,10 +82,10 @@ int start3(char *arg)
     
     bug_flag("start3(): sys_vec assignment.", false, 0);
 
-    sys_vec[SYS_SLEEP] = sleep_vec_in;
+    sys_vec[SYS_SLEEP] = sleep;
     sys_vec[SYS_DISKREAD] = disk_read;
-    sys_vec[SYS_DISKWRITE] = disk_write_vec_in;
-    sys_vec[SYS_DISKSIZE] = disk_size_vec_in;
+    sys_vec[SYS_DISKWRITE] = disk_write;
+    sys_vec[SYS_DISKSIZE] = disk_size;
     
     /* Initialize the phase 4 process table */
 
@@ -178,6 +177,9 @@ int start3(char *arg)
 
     for (i = 0; i < DISK_UNITS; i++)
     {
+        
+        exit_logic = true;
+
         bug_flag("start3(): semv disk_semaphore", false, 0);
         semv_real(disk_semaphore);
 
@@ -288,25 +290,148 @@ static int DiskDriver(char *arg)
 
     bug_flag("DiskDriver(): enter while loop till zapped.", true, unit);
 
-    /* Main Disk Driver functionality. */
+    while (exit_logic != true)
+    {
 
+        /* Wait request from user. */
+        bug_flag("DiskDriver(): semp on disk semaphore to wait for requests.", true, unit);
+        semp_real(disk_semaphore);
 
+        /* Set next request for DiskQ. */
+        bug_flag("DiskDriver(): setting current_req = DQ.", true, unit);
+        current_req = DQ;
+            
+        if (current_req != NULL)
+        {
+            /* Check disk_size request. */
+            bug_flag("DiskDriver(): checking current_req operation type.", true, unit);
+            if (current_req->operation == DISK_SIZE)
+            {
+                /* Critical region in. */
+                bug_flag("DiskDriver(): size - semP on dq_sem to enter critical region.", true, unit);
+                semp_real(DQ_semaphore);
 
+                DQ_number = remove_disk_q(current_req);
+            
+                /* Critical region out. */
+                bug_flag("DiskDriver(): size - semV on DQ_sem to leave critical region.", true, unit);
+                semv_real(DQ_semaphore);
 
-    /* quit state to join next. */
+                /* Wake up user. */
+                bug_flag("DiskDriver(): size - semV on private_sem to unblock proc.", true, unit);
+                semv_real(current_req->private_sem);
+            }
+            else
+            {
+                /* Critical region in. */
+                bug_flag("DiskDriver(): rw - semp on dq_sem to enter critical region.", true, unit);
+                semp_real(DQ_semaphore);
+
+                DQ_number = remove_disk_q(current_req); 
+
+                /* Critical region out. */
+                bug_flag("DiskDriver(): rw - semV on DQ_sem to leave critical region.", true, unit);
+                semv_real(DQ_semaphore);
+
+                /* Critical region in for disk operations. */
+                bug_flag("DiskDriver(): rw - semp on driver_sync sem enter region.", true, unit);
+                semp_real(driver_sync_semaphore);
+
+                /* Adjust disk_seek. */
+                my_request.opr  = DISK_SEEK;
+                my_request.reg1 = current_req->track_start;
+                result = device_output(DISK_DEV, current_req->unit, &my_request);
+
+                if (result != DEV_OK) 
+                {
+                    console("DiskDriver (%d): did not get DEV_OK on 1st DISK_SEEK call\n", unit);
+                    console("DiskDriver (%d): is the file disk%d present???\n", unit, current_req->unit);
+                    halt(1);
+                }
+
+                waitdevice(DISK_DEV, current_req->unit, &status);
+
+                /* Set read/write loop variables. */
+                current_track = current_req->track_start; 
+                current_sector = current_req->sector_start; 
+                counter = 0; 
+
+                /* read/write operations. */
+                while (counter != current_req->num_sectors)
+                {
+                    my_request.opr = current_req->operation;
+                    my_request.reg1 = current_sector;
+                    my_request.reg2 = &current_req->disk_buf[counter * DISK_SECTOR_SIZE];
+                    result = device_output(DISK_DEV, current_req->unit, &my_request);
+
+                    if (result != DEV_OK) 
+                    {
+                        console("DiskDriver (%d): did not get DEV_OK on %d call\n", unit, current_req->operation);
+                        console("DiskDriver (%d): is the file disk%d present???\n", unit, current_req->unit);
+                        halt(1);
+                    }
+
+                    waitdevice(DISK_DEV, current_req->unit, &status);
+                    current_req->status = status;
+
+                    /* Check to finish reading/writing. */
+                    counter++;
+                    if (counter != current_req->num_sectors)
+                    {
+
+                        /* Update sector. */
+                        current_sector++;
+
+                        /* Test for sector's out of bound. */
+                        if (current_sector >= DISK_TRACK_SIZE) 
+                        {
+                            current_track = (current_track + 1) % num_tracks[unit];
+                            current_sector = 0;
+
+                            my_request.opr  = DISK_SEEK;
+                            my_request.reg1 = current_track;
+                            result = device_output(DISK_DEV, current_req->unit, &my_request);
+
+                            if (result != DEV_OK) 
+                            {
+                                console("DiskDriver (%d): did not get DEV_OK on DISK_SEEK call\n", unit);
+                                console("DiskDriver (%d): is the file disk%d present???\n", unit, current_req->unit);
+                                halt(1);
+                            }
+
+                            waitdevice(DISK_DEV, current_req->unit, &status);
+                        }
+                    }
+                }
+
+                /* Critical region out. */
+                bug_flag("DiskDriver(): rw - semv on driver_sync sem leave region.", true, unit);
+                semv_real(driver_sync_semaphore);
+            }
+            /* Wake up user. */     
+            bug_flag("DiskDriver(): rw - semv on private_sem to unblock proc.", true, unit);
+            semv_real(current_req->private_sem);
+        }    
+    }
+
+    /* quit state to joing next. */
     quit(0);
 } /* DiskDriver */
 
 
-/* sleep_vec_in */
-static void sleep_vec_in(sysargs *args_ptr)
+/* sleep */
+static void sleep(sysargs *args_ptr)
 {
+    /* Temps. */
     int seconds;
     int result;
+    driver_proc_ptr current_proc;
+    current_proc = &Driver_Table[getpid() % MAXPROC];
 
+    /* Set value. */
     seconds = (int) args_ptr->arg1;
 
-    /* Validating seconds can't have negative time. If so return -1.*/
+    /* Validating seconds can't have negative time. If so return.*/
     if (seconds < 0)
     {
         result = -1;
@@ -314,61 +439,35 @@ static void sleep_vec_in(sysargs *args_ptr)
         return;
     }
 
-    bug_flag("sleep_vec_in(): calling sleep_prep.", false, 0);
-    result = sleep_prep(seconds);
+    /* Enter critical region. */
+    bug_flag("sleep(): call semp on sleep_sem.", false, 0);
+    semp_real(sleep_semaphore);
 
-    bug_flag("sleep_vec_in(): sleep_prep returned.", false, 0);
+    bug_flag("sleep(): call insert_sleep_q.", false, 0);
+    sleep_number = insert_sleep_q(current_proc);
+
+    /* Save time for sleep. */
+    current_proc->wake_time = sys_clock();
+    current_proc->wake_time = (seconds * 1000000) + current_proc->wake_time;
+
+    bug_flag("sleep(): call semv on sleep_sem.", false, 0);
+    semv_real(sleep_semaphore);
+
+    bug_flag("sleep(): call semp on proccesse private sem to block it.", false, 0);
+    semp_real(current_proc->private_sem);
+
+    /* Set result arg4 to 0. */
+    result = 0;
     args_ptr->arg4 = (void *) result;
 
     return;
-} /* sleep_vec_in */
-
-
-/* sleep_prep */
-int sleep_prep(int seconds)
-{
-    //attempt to enter the critical region
-    bug_flag("sleep_prep(): call semp on sleep_sem.", false, 0);
-
-    semp_real(sleep_semaphore);
-
-    driver_proc_ptr current_proc;
-    current_proc = &Driver_Table[getpid() % MAXPROC];
-
-    //put process onto the sleep queue
-
-    bug_flag("sleep_prep(): call insert_sleep_q.", false, 0);
-
-    sleep_number = insert_sleep_q(current_proc);
-
-    //record the time it was put to sleep
-    current_proc->sleep_time = sys_clock();
-
-
-    //-------------------------
-    //record amount of seconds to sleep as microseconds
-    //add bedtime to get the time to wake up
-    current_proc->wake_time = (seconds * 1000000) + current_proc->sleep_time;
-
-    //leave the critical region
-
-    bug_flag("sleep_prep(): call semv on sleep_sem.", false, 0);
-
-    semv_real(sleep_semaphore);
-
-    //block the process possibly with sem/mutex/mailboxreceive
-
-    bug_flag("sleep_prep(): call semp on proc's private sem to block it.", false, 0);
-
-    semp_real(current_proc->private_sem);
-
-    return 0;
-} /* sleep_prep */
+} /* sleep */
 
 
 /* disk_read */
 static void disk_read(sysargs *args_ptr)
 {
+    /* Temps. */
     int unit;
     int track;
     int first;
@@ -376,6 +475,8 @@ static void disk_read(sysargs *args_ptr)
     void *buffer;
     int status;
     int result = 0;
+    driver_proc_ptr current_proc;
+    current_proc = &Driver_Table[getpid() % MAXPROC];
 
     buffer = args_ptr->arg1;
     sectors = (int) args_ptr->arg2;
@@ -383,12 +484,12 @@ static void disk_read(sysargs *args_ptr)
     first = (int) args_ptr->arg4;
     unit = (int) args_ptr->arg5;
 
-    /* Validating arguments */
-    if (unit < 0 || unit > 1) //disk unit #
+    /* Testing arguments. */
+    if (unit < 0 || unit > 1)                   //disk unit #
     {
         result = -1;
     }
-    if (sectors < 0) //# of sectors to read
+    if (sectors < 0)                            //# of sectors to read
     {
         result = -1;
     }
@@ -396,58 +497,58 @@ static void disk_read(sysargs *args_ptr)
     {
         result = -1;
     }
-    if (first < 0 || first > 15) //starting sector #
+    if (first < 0 || first > 15)                //starting sector #
     {
         result = -1;
     }
 
+    /* Testing for error value. */
     if (result == -1)
     {
-        bug_flag("disk_read(): illegal values given, result == -1.");
+        bug_flag("disk_read(): error value return. ", false, 0);
         args_ptr->arg1 = (void *) result;
         args_ptr->arg4 = (void *) result;
         return;
     }
 
+    /* Critical region in. */
+    bug_flag("disk_read(): call semP on DQ_semaphore.", false, 0);
     semp_real(DQ_semaphore);
 
-    driver_proc_ptr current_proc;
-    current_proc = &Driver_Table[getpid() % MAXPROC];
-
-    /* Request point. */
+    /* Drive request. */
     current_proc->operation = DISK_READ;
-    current_proc->unit = unit; //which disk to read
-    current_proc->track_start = track; //starting track
-    current_proc->sector_start = first; //starting sector
-    current_proc->num_sectors = sectors; //number of sectors
-    current_proc->disk_buf = buffer; //data buffer
+    current_proc->unit = unit;              // which disk unit in read
+    current_proc->track_start = track;      // starting track
+    current_proc->sector_start = first;     // starting sector
+    current_proc->num_sectors = sectors;    // # sectors
+    current_proc->disk_buf = buffer;        // buffer
 
-    /* Disk Q save. */
+    /* Insert DQ. */
     DQ_number = insert_disk_q(current_proc);
 
-    //leave the critical region
-    bug_flag("disk_read(): call semV on DQ_sem.");
+    /* Critical region out. */
+    bug_flag("disk_read(): call semV on DQ_sem.", false, 0);
     semv_real(DQ_semaphore);
 
-    //alert Disk Driver there's an entry in DQ
+    /* Send Disk Driver an entry in DQ. */
     semv_real(disk_semaphore);
 
-    //wait for Disk Driver to complete operation
-    bug_flag("disk_read(): call semp on proc's private sem to block it.");
+    /* Wait Disk Driver to complete operations. */
+    bug_flag("disk_read(): call semp on proc's private sem to block it.", false, 0);
     semp_real(current_proc->private_sem);
     
+    /* Set arg's values. */
     status = current_proc->status;
-    
     args_ptr->arg1 = (void *) status;
     args_ptr->arg4 = (void *) result;
     return;
 } /* disk_read */
 
 
-/* disk_write_vec_in */
-static void 
-disk_write_vec_in(sysargs *args_ptr)
+/* disk_write */
+static void disk_write(sysargs *args_ptr)
 {
+    /* Temps. */
     int unit;
     int track;
     int first;
@@ -456,6 +557,8 @@ disk_write_vec_in(sysargs *args_ptr)
     int status; 
     int result = 0;
     int flag;
+    driver_proc_ptr current_proc;
+    current_proc = &Driver_Table[getpid() % MAXPROC];
 
     buffer = args_ptr->arg1;
     sectors = (int) args_ptr->arg2;
@@ -463,13 +566,13 @@ disk_write_vec_in(sysargs *args_ptr)
     first = (int) args_ptr->arg4;
     unit = (int) args_ptr->arg5;
 
-    //check validity of arguments
-    if (unit < 0 || unit > 1) //disk unit #
+    /* Testing arguments. */
+    if (unit < 0 || unit > 1)                   //disk unit #
     {
         result = -1;
         flag = 0;
     }
-    if (sectors < 0) //# of sectors to read
+    if (sectors < 0)                            //# of sectors to read
     {
         result = -1;
         flag = 1;
@@ -479,152 +582,108 @@ disk_write_vec_in(sysargs *args_ptr)
         result = -1;
         flag = 2;
     }
-    if (first < 0 || first > 15) //starting sector #
+    if (first < 0 || first > 15)                //starting sector #
     {
         result = -1;
         flag = 3;
     }
 
-    //what kind of validity check for the buffer?
-
+    /* Testing for error value. */
     if (result == -1)
     {
-        if (DEBUG4 && debugflag4)
-        {
-            console("disk_write_vec_in(): result == -1, illegal values.\n");
-            console("disk_write_vec_in(): illegal value is %d.\n", flag);
-        }
+        bug_flag("disk_write(): error (illegal value) = ", true, flag);
         args_ptr->arg1 = (void *) result;
         args_ptr->arg4 = (void *) result;
         return;
     }
 
-    status = disk_write_real(unit, track, first, sectors, buffer);
-
-    bug_flag("disk_write_real(): call semp on DQ_sem.", false, 0);
+    /* Critical region in. */
+    bug_flag("disk_write(): call semp on DQ_sem.", false, 0);
     semp_real(DQ_semaphore);
 
-    //initialize current_proc
-    driver_proc_ptr current_proc;
-    current_proc = &Driver_Table[getpid() % MAXPROC];
-
-    //pack the request
+    /* Drive request. */
     current_proc->operation = DISK_WRITE;
-    current_proc->unit = unit; //which disk to write to
-    current_proc->track_start = track; //starting track
-    current_proc->sector_start = first; //starting sector
-    current_proc->num_sectors = sectors; //number of sectors
-    current_proc->disk_buf = buffer; //data buffer
+    current_proc->unit = unit;              // which disk unit in write
+    current_proc->track_start = track;      // starting track
+    current_proc->sector_start = first;     // starting sector
+    current_proc->num_sectors = sectors;    // # of sectors
+    current_proc->disk_buf = buffer;        // buffer
 
-    //put request on the DQ
+    /* Insert DQ. */
     DQ_number = insert_disk_q(current_proc);
 
-    //leave the critical region
-    bug_flag("disk_write_real(): call semV on DQ_sem.", false, 0);
+    /* Critical region out. */
+    bug_flag("disk_write(): call semV on DQ_sem.", false, 0);
     semv_real(DQ_semaphore);
 
-    //alert Disk Driver there's an entry in DQ
+    /* Send Disk Driver an entry in DQ. */
     semv_real(disk_semaphore);
 
-    //wait for Disk Driver to complete operation
-    bug_flag("disk_write_real(): call semp on proc's private sem to block it.", false, 0);
+    /* Wait Disk Driver to complete operations. */
+    bug_flag("disk_write(): call semp on proc's private sem to block it.", false, 0);
     semp_real(current_proc->private_sem);
 
-    //return status
-    if (DEBUG4 && debugflag4)
-    {
-        if (current_proc->status == 0) 
-        {
-            console("disk_write_real(): status returned as 0\n");
-        }
-        else
-        {
-            console("disk_write_real(): status returned as &d\n", current_proc->status);
-        }
-    }
-    
+    /* Set arg's values. */
     status = current_proc->status;
-    
     args_ptr->arg1 = (void *) status; 
     args_ptr->arg4 = (void *) result;
     return;
-} /* disk_write_vec_in */
+} /* disk_write */
 
 
-/* disk_size_vec_in */
-static void disk_size_vec_in(sysargs *args_ptr)
+/* disk_size */
+static void disk_size(sysargs *args_ptr)
 {
+    /* Temps. */
     int unit;
     int sector;
     int track;
     int disk;
     int result;
-
+    driver_proc_ptr current_proc;
+    current_proc = &Driver_Table[getpid() % MAXPROC];
+    
+    /* Set value. */
     unit = (int) args_ptr->arg1;
-    //check validity of unit
+
+    /* Testing input value. */
     if (unit < 0 || unit > 1)
     {
         result = -1;
-        console("disk_size_vec_in(): illegal value, unit < 0 or > 1.\n");
+        console("disk_size(): illegal value, unit < 0 or > 1.\n");
         args_ptr->arg4 = (void *) result;
         return;
     }
 
-    result = disk_size_prep(unit, &sector, &track, &disk);
+    /* Critical region in. */
+    bug_flag("disk_size_real(): call semP on DQ_sem.", false, 0);
+    semp_real(DQ_semaphore);
 
-    if (DEBUG4 && debugflag4)
-    {
-        console ("disk_size_vec_in(): after _real, sector = %d, track = %d, disk = %d\n", sector, track, disk);
-    }
+    current_proc->operation = DISK_SIZE;
+    DQ_number = insert_disk_q(current_proc);
 
-    if (result == -1)
-    {
-        console("disk_size_vec_in(): disk_size_prep returned -1, illegal values\n");
-    }
+    /* Critical region out. */
+    bug_flag("disk_size_real(): call semV on DQ_sem.", false, 0);
+    semv_real(DQ_semaphore);
+
+    /* Send Disk Driver an entry in DQ. */
+    semv_real(disk_semaphore);
+
+    /* Wait Disk Driver to complete operations. */
+    bug_flag("disk_size_real(): call semp on proc's private sem to block it.", false, 0);
+    semp_real(current_proc->private_sem);
+
+    /* Set arg's values. */
+    sector = DISK_SECTOR_SIZE;
+    track = DISK_TRACK_SIZE;
+    disk = num_tracks[unit];
+    result = 0;
     args_ptr->arg1 = (void *) sector;
     args_ptr->arg2 = (void *) track;
     args_ptr->arg3 = (void *) disk;
     args_ptr->arg4 = (void *) result;
     return;
-} /* disk_size_vec_in */
-
-
-/* disk_size_prep */
-int disk_size_prep(int unit, int *sector, int *track, int *disk)
-{
-
-    //attempt to enter the critical region
-    bug_flag("disk_size_prep(): call semP on DQ_sem.", false, 0);
-    semp_real(DQ_semaphore);
-
-    driver_proc_ptr current_proc;
-    current_proc = &Driver_Table[getpid() % MAXPROC];
-    current_proc->operation = DISK_SIZE;
-    DQ_number = insert_disk_q(current_proc);
-
-    //leave the critical region
-    bug_flag("disk_size_prep(): call semV on DQ_sem.", false, 0);
-    semv_real(DQ_semaphore);
-
-    //alert Disk Driver there's an entry in DQ
-    semv_real(disk_semaphore);
-
-    //wait for Disk Driver to complete operation
-    bug_flag("disk_size_prep(): call semp on proc's private sem to block it.", false, 0);
-    semp_real(current_proc->private_sem);
-
-    //assign values and return
-    *sector = DISK_SECTOR_SIZE;
-    *track = DISK_TRACK_SIZE;
-    *disk = num_tracks[unit];
-
-    if (DEBUG4 && debugflag4)
-    {
-        console ("disk_size_prep(): values after - sector = %d, track = %d, disk = %d\n", *sector, *track, *disk);
-    }
-
-    return 0;
-} /* disk_size_prep */
+} /* disk_size */
 
 
 /* insert_sleep_q */
@@ -665,9 +724,7 @@ int remove_sleep_q(driver_proc_ptr proc_ptr)
     driver_proc_ptr walker, previous;
     walker = SleepQ;
 
-    //protect the SleepQ with a semaphore
-    //enter critical region
-
+    /* Critical region in. */
     bug_flag("remove_sleep_q(): semp on sleep_sem.", false, 0);
     semp_real(sleep_semaphore);
 
@@ -709,7 +766,7 @@ int remove_sleep_q(driver_proc_ptr proc_ptr)
         }   
     }
 
-    //leave critical region
+    /* Critical region out. */
     bug_flag("remove_sleep_q(): semv on sleep_sem.", false, 0);
     semv_real(sleep_semaphore);
 
@@ -754,10 +811,6 @@ int remove_disk_q(driver_proc_ptr proc_ptr)
     int num_disk_procs = DQ_number;
     driver_proc_ptr walker, previous;
     walker = DQ;
-
-    //if DQ is empty
-
-    bug_flag("remove_disk_q(): DQ empty. Return.", false, 0);
     
     //if DQ has one entry
     if (num_disk_procs == 1)
